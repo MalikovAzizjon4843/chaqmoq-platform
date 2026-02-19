@@ -1,0 +1,15 @@
+[Unit]
+Description=Chaqmoq Media Bot
+After=network.target postgresql.service
+
+[Service]
+User=ubuntu
+EnvironmentFile=/etc/environment
+ExecStart=/usr/bin/java -Xmx512m -jar /opt/chaqmoq/media-bot.jar
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/chaqmoq-media.log
+StandardError=append:/var/log/chaqmoq-media-error.log
+
+[Install]
+WantedBy=multi-user.target

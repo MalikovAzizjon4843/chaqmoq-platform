@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mvn clean compile:*)",
+      "Bash(where:*)",
+      "Bash(dir \"C:\\\\Program Files\\\\Apache\\\\maven\\\\bin\")",
+      "Bash(dir \"C:\\\\apache-maven*\")",
+      "Bash(dir \"%MAVEN_HOME%\\\\bin\")",
+      "Bash(cmd.exe /c \"where mvn\")",
+      "Bash(cmd.exe /c \"where mvn.cmd\")",
+      "Bash(powershell -Command:*)",
+      "Bash(echo:*)",
+      "Bash(java -version)",
+      "Bash(curl:*)",
+      "Bash(cmd.exe /c \"mvnw.cmd clean compile -pl chaqmoq-common\")"
+    ]
+  }
+}

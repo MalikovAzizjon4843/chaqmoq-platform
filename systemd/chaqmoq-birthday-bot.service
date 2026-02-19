@@ -1,0 +1,15 @@
+[Unit]
+Description=Chaqmoq Birthday Bot
+After=network.target postgresql.service
+
+[Service]
+User=ubuntu
+EnvironmentFile=/etc/environment
+ExecStart=/usr/bin/java -Xmx512m -jar /opt/chaqmoq/birthday-bot.jar
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/chaqmoq-birthday.log
+StandardError=append:/var/log/chaqmoq-birthday-error.log
+
+[Install]
+WantedBy=multi-user.target
