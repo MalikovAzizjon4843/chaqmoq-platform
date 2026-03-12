@@ -31,6 +31,8 @@ public class MediaDownloadService {
     @Value("${ytdlp.cookies.path:}")
     private String cookiesPath;
 
+    private String currentDownloadType;
+
     private final PlatformDetector platformDetector;
 
     public MediaDownloadService(PlatformDetector platformDetector) {
@@ -87,16 +89,18 @@ public class MediaDownloadService {
     }
 
     public DownloadResult downloadAsRoundVideo(String url) {
-        DownloadResult result = download(url, "video");
-        if (!result.isSuccessful()) return result;
-
+        // 1. Avval oddiy video yuklash (yt-dlp)
+        DownloadResult raw = download(url, "video_720");
+        if (!raw.isSuccessful()) return raw;
+        
+        // 2. FFmpeg bilan crop + compress (384x384, max 11MB)
         try {
-            File roundFile = convertToRoundVideo(result.getFile());
-            cleanupFile(result.getFile());
-            return DownloadResult.success(roundFile, result.getTitle(), "round");
+            File roundFile = convertToRoundVideo(raw.getFile());
+            raw.getFile().delete(); // asl faylni o'chir
+            return DownloadResult.success(roundFile, raw.getTitle(), "round");
         } catch (Exception e) {
-            cleanupFile(result.getFile());
-            return DownloadResult.failure("Video dumaloq formatga o'girishda xato: " + e.getMessage());
+            log.error("Round video conversion failed", e);
+            return DownloadResult.failure("Round video yaratishda xatolik");
         }
     }
 
@@ -198,6 +202,7 @@ public class MediaDownloadService {
     }
 
     private DownloadResult download(String url, String type) {
+        this.currentDownloadType = type;
         File folder = createTempFolder();
 
         try {
@@ -268,7 +273,7 @@ public class MediaDownloadService {
 
 
             command.addAll(List.of(
-                    "--max-filesize", "500M",
+                    "--max-filesize", "50M",
                     "--no-check-certificates",
                     "-o", folder.getAbsolutePath() + "/%(title)s.%(ext)s",
                     url
@@ -378,42 +383,80 @@ public class MediaDownloadService {
     }
 
     private File convertToRoundVideo(File inputFile) throws Exception {
-        File outputFile = new File(inputFile.getParent(), "round_" + System.currentTimeMillis() + ".mp4");
-
-        List<String> command = List.of(
-                ffmpegPath,
-                "-i", inputFile.getAbsolutePath(),
-                "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=384:384",
-                "-t", "60",
-                "-c:v", "libx264",
-                "-crf", "28",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-y",
-                outputFile.getAbsolutePath()
-        );
-
-        ProcessBuilder pb = new ProcessBuilder(command);
+        String outputPath = inputFile.getParent() + 
+            File.separator + "round_" + System.currentTimeMillis() + ".mp4";
+        
+        List<String> cmd = new ArrayList<>(List.of(
+            ffmpegPath,
+            "-i", inputFile.getAbsolutePath(),
+            "-t", "60",
+            "-vf", "crop=min(iw\\,ih):min(iw\\,ih),scale=384:384",
+            "-c:v", "libx264",
+            "-crf", "35",
+            "-preset", "fast",
+            "-c:a", "aac",
+            "-b:a", "48k",
+            "-b:v", "150k",
+            "-maxrate", "150k",
+            "-bufsize", "300k",
+            "-movflags", "+faststart",
+            "-y",
+            outputPath
+        ));
+        
+        ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.redirectErrorStream(true);
         Process process = pb.start();
-
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            while (reader.readLine() != null) {
-                // consume output
-            }
-        }
-
         boolean finished = process.waitFor(120, TimeUnit.SECONDS);
+        
         if (!finished) {
             process.destroyForcibly();
-            throw new RuntimeException("FFmpeg vaqti tugadi");
+            throw new Exception("FFmpeg timeout");
         }
-
-        if (process.exitValue() != 0) {
-            throw new RuntimeException("FFmpeg xato bilan tugadi");
+        
+        File roundFile = new File(outputPath);
+        log.info("Round video converted: {}MB → {}MB",
+            inputFile.length() / 1024 / 1024,
+            roundFile.length() / 1024 / 1024);
+        
+        // Hali ham 11MB dan katta bo'lsa qayta compress
+        long maxBytes = 11L * 1024 * 1024;
+        if (roundFile.length() > maxBytes) {
+            log.info("Round video still too large ({}MB), recompressing with crf 40...",
+                roundFile.length() / 1024 / 1024);
+                
+            String outputPath2 = inputFile.getParent() + 
+                File.separator + "round2_" + System.currentTimeMillis() + ".mp4";
+            List<String> cmd2 = new ArrayList<>(List.of(
+                ffmpegPath,
+                "-i", roundFile.getAbsolutePath(),
+                "-c:v", "libx264",
+                "-crf", "40",
+                "-preset", "fast",
+                "-c:a", "aac",
+                "-b:a", "32k",
+                "-b:v", "100k",
+                "-maxrate", "100k",
+                "-bufsize", "200k",
+                "-y",
+                outputPath2
+            ));
+            ProcessBuilder pb2 = new ProcessBuilder(cmd2);
+            pb2.redirectErrorStream(true);
+            Process p2 = pb2.start();
+            p2.waitFor(120, TimeUnit.SECONDS);
+            
+            if (p2.exitValue() == 0) {
+                roundFile.delete();
+                roundFile = new File(outputPath2);
+                log.info("Round video recompressed: {}MB",
+                    roundFile.length() / 1024 / 1024);
+            } else {
+                log.warn("Recompression failed, using original");
+            }
         }
-
-        return outputFile;
+        
+        return roundFile;
     }
 
     private String parseError(String output) {
@@ -427,7 +470,25 @@ public class MediaDownloadService {
         if (o.contains("geo-restricted")) return "Bu video sizning mintaqangizda mavjud emas";
         if (o.contains("age-restricted") || o.contains("age restricted") || o.contains("age")) return "Bu video yosh chegarasi bilan cheklangan";
         if (o.contains("copyright")) return "Mualliflik huquqi tufayli video mavjud emas";
-        if (o.contains("file is larger than max-filesize")) return "⚠️ Video hajmi 500MB dan katta.\nPastroq sifat tanlang: 360p yoki 480p";
+        if (o.contains("file is larger than max-filesize")) {
+            String hint = "";
+            if (currentDownloadType != null) {
+                if (currentDownloadType.equals("video_1080")) {
+                    hint = "720p yoki 480p ni sinab ko'ring";
+                } else if (currentDownloadType.equals("video_720")) {
+                    hint = "480p yoki 360p ni sinab ko'ring";
+                } else if (currentDownloadType.equals("video_480")) {
+                    hint = "360p ni sinab ko'ring";
+                } else if (currentDownloadType.equals("video_360")) {
+                    hint = "Video juda uzun. Audio sifatida yuklab oling";
+                } else {
+                    hint = "Pastroq sifat tanlang";
+                }
+            } else {
+                hint = "Pastroq sifat tanlang";
+            }
+            return "⚠️ Video hajmi 50MB dan katta.\n\n💡 " + hint;
+        }
         if (o.contains("file is larger")) return "Fayl hajmi juda katta (max " + maxFileSizeMb + "MB)";
         if (o.contains("unsupported url")) return "Bu turdagi havola qo'llab-quvvatlanmaydi. Boshqa havola yuboring";
         if (o.contains("timed out") || o.contains("timeout")) return "Ulanish vaqti tugadi. Qayta urinib ko'ring";
@@ -497,6 +558,38 @@ public class MediaDownloadService {
         File folder = new File(tempBase, UUID.randomUUID().toString());
         folder.mkdirs();
         return folder;
+    }
+
+    public File compressRoundVideo(File inputFile) throws Exception {
+        String outputPath = inputFile.getParent() + 
+            File.separator + "compressed_" + System.currentTimeMillis() + ".mp4";
+        
+        List<String> cmd = List.of(
+            ffmpegPath,
+            "-i", inputFile.getAbsolutePath(),
+            "-c:v", "libx264",
+            "-crf", "40",
+            "-preset", "fast",
+            "-c:a", "aac",
+            "-b:a", "32k",
+            "-b:v", "100k",
+            "-maxrate", "100k",
+            "-bufsize", "200k",
+            "-y",
+            outputPath
+        );
+        
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        process.waitFor(120, TimeUnit.SECONDS);
+        
+        File compressed = new File(outputPath);
+        log.info("Compressed round video: {}MB → {}MB",
+            inputFile.length() / 1024 / 1024,
+            compressed.length() / 1024 / 1024);
+        
+        return compressed;
     }
 
     public void cleanupFile(File file) {

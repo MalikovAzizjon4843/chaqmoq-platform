@@ -303,9 +303,18 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
         editMessage(chatId, messageId, "⏳ " + platform.getEmoji() + " " + typeName + " yuklanmoqda...\n\nBiroz kuting...");
 
         try {
-            // Katta fayl bo'lishi mumkin bo'lgan holatlarda splitAndDownload ishlatish
-            List<MediaDownloadService.DownloadResult> results =
-                    mediaDownloadService.splitAndDownload(url, type);
+            List<MediaDownloadService.DownloadResult> results;
+            
+            // Round video uchun alohida metod
+            if ("round".equals(type)) {
+                logger.info("processDownload: round type detected, calling downloadAsRoundVideo()");
+                MediaDownloadService.DownloadResult roundResult = 
+                    mediaDownloadService.downloadAsRoundVideo(url);
+                results = List.of(roundResult);
+            } else {
+                // Boshqa type'lar uchun splitAndDownload
+                results = mediaDownloadService.splitAndDownload(url, type);
+            }
 
             // Har bir qismni yuborish
             int total = results.size();
@@ -330,6 +339,9 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
                 }
 
                 try {
+                    logger.info("processDownload: mediaType={}, fileSize={}MB",
+                        result.getMediaType(),
+                        result.getFile().length() / 1024 / 1024);
                     sendMediaFileWithCaption(chatId, result.getFile(), result.getTitle(), result.getMediaType(), i+1, total);
                     userService.recordDownload(userId, url, platform.getName(), type, true, null);
                 } finally {
@@ -352,50 +364,32 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
     }
 
     private void sendMediaFile(Long chatId, File file, String title, String type) throws TelegramApiException {
+        logger.info("Sending media: type={}, size={}MB, file={}",
+            type,
+            file.length() / 1024 / 1024,
+            file.getName());
+        
         InputFile inputFile = new InputFile(file);
 
         switch (type) {
-            case "audio" -> {
-                SendAudio sendAudio = SendAudio.builder()
-                        .chatId(chatId.toString())
-                        .audio(inputFile)
-                        .title(title)
-                        .caption("🎵 " + title)
-                        .build();
-                execute(sendAudio);
-            }
             case "round" -> {
-                SendVideoNote sendVideoNote = SendVideoNote.builder()
-                        .chatId(chatId.toString())
-                        .videoNote(inputFile)
-                        .build();
-                execute(sendVideoNote);
+                logger.info("Sending round video, size={}MB", 
+                    file.length() / 1024 / 1024);
+                SendVideoNote send = new SendVideoNote();
+                send.setChatId(chatId.toString());
+                send.setVideoNote(new InputFile(file));
+                execute(send);
             }
-            default -> {
-                long fileSizeBytes = file.length();
-                long limit = 50L * 1024 * 1024; // 50MB
-
-                if (fileSizeBytes <= limit) {
-                    // Kichik fayl — video sifatida
-                    SendVideo send = new SendVideo();
-                    send.setChatId(chatId.toString());
-                    send.setVideo(inputFile);
-                    send.setCaption("⚡ @" + botUsername);
-                    send.setSupportsStreaming(true);
-                    execute(send);
-                } else {
-                    // Katta fayl — document sifatida
-                    // Foydalanuvchiga oldin xabar ber
-                    sendText(chatId,
-                            "📁 Video hajmi katta, fayl sifatida yuborilmoqda...");
-                    SendDocument send = new SendDocument();
-                    send.setChatId(chatId.toString());
-                    send.setDocument(inputFile);
-                    send.setCaption("⚡ @" + botUsername +
-                            "\n📥 Yuklab olib, video pleyer bilan oching");
-                    execute(send);
-                }
+            case "audio" -> {
+                SendAudio send = new SendAudio();
+                send.setChatId(chatId.toString());
+                send.setAudio(inputFile);
+                send.setTitle(title);
+                send.setCaption("🎵 " + title);
+                execute(send);
             }
+            case "video" -> sendVideoFile(chatId, file, "⚡ @" + botUsername);
+            default -> sendVideoFile(chatId, file, "⚡ @" + botUsername);
         }
     }
 
@@ -403,31 +397,24 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
         InputFile inputFile = new InputFile(file);
 
         switch (type) {
-            case "audio" -> {
-                SendAudio sendAudio = SendAudio.builder()
-                        .chatId(chatId.toString())
-                        .audio(inputFile)
-                        .title(title)
-                        .caption("📦 " + partNumber + "/" + totalParts + " qism\n🎵 " + title)
-                        .build();
-                execute(sendAudio);
-            }
             case "round" -> {
-                SendVideoNote sendVideoNote = SendVideoNote.builder()
-                        .chatId(chatId.toString())
-                        .videoNote(inputFile)
-                        .build();
-                execute(sendVideoNote);
+                logger.info("Sending round video, size={}MB", 
+                    file.length() / 1024 / 1024);
+                SendVideoNote send = new SendVideoNote();
+                send.setChatId(chatId.toString());
+                send.setVideoNote(new InputFile(file));
+                execute(send);
             }
-            default -> {
-                SendVideo sendVideo = SendVideo.builder()
-                        .chatId(chatId.toString())
-                        .video(inputFile)
-                        .caption("📦 " + partNumber + "/" + totalParts + " qism\n⚡ @" + botUsername)
-                        .supportsStreaming(true)
-                        .build();
-                execute(sendVideo);
+            case "audio" -> {
+                SendAudio send = new SendAudio();
+                send.setChatId(chatId.toString());
+                send.setAudio(inputFile);
+                send.setTitle(title);
+                send.setCaption("📦 " + partNumber + "/" + totalParts + " qism\n🎵 " + title);
+                execute(send);
             }
+            case "video" -> sendVideoFile(chatId, file, "📦 " + partNumber + "/" + totalParts + " qism\n⚡ @" + botUsername);
+            default -> sendVideoFile(chatId, file, "📦 " + partNumber + "/" + totalParts + " qism\n⚡ @" + botUsername);
         }
     }
 
@@ -708,6 +695,15 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
         } catch (TelegramApiException e) {
             logger.error("Error editing message: {}", e.getMessage());
         }
+    }
+
+    private void sendVideoFile(Long chatId, File file, String caption) throws TelegramApiException {
+        SendVideo send = new SendVideo();
+        send.setChatId(chatId.toString());
+        send.setVideo(new InputFile(file));
+        send.setCaption(caption);
+        send.setSupportsStreaming(true);
+        execute(send);
     }
 
     private String escapeMarkdown(String text) {
