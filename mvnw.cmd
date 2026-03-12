@@ -47,6 +47,18 @@ goto error
 
 :OkJHome
 set "JAVACMD=%JAVA_HOME%\bin\java.exe"
+if exist "%JAVACMD%" goto chkMHome
+
+@REM JAVA_HOME points to a non-existing java.exe (common on Windows). Fall back to PATH.
+set "JAVA_HOME="
+for %%i in (java.exe) do set "JAVACMD=%%~$PATH:i"
+if NOT "%JAVACMD%"=="" goto chkMHome
+
+echo.
+echo Error: JAVA_HOME is defined but no 'java' command could be found.
+echo Please fix JAVA_HOME or add Java to PATH.
+echo.
+goto error
 
 :chkMHome
 if NOT "%MAVEN_BASEDIR%"=="" goto baseDirDefined
@@ -117,7 +129,7 @@ IF NOT %WRAPPER_SHA_256_SUM%=="" (
 @REM work with both Windows and non-Windows executions.
 set MAVEN_CMD_LINE_ARGS=%*
 
-%JAVACMD% ^
+"%JAVACMD%" ^
   %JVM_CONFIG_MAVEN_PROPS% ^
   %MAVEN_OPTS% ^
   %MAVEN_DEBUG_OPTS% ^

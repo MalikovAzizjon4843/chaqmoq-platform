@@ -4,10 +4,11 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import uz.chaqmoq.media.util.PlatformDetector;
 
 import java.io.*;
 import java.nio.file.Files;
-import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -27,28 +28,43 @@ public class MediaDownloadService {
     @Value("${app.max.filesize.mb:50}")
     private int maxFileSizeMb;
 
+    @Value("${ytdlp.cookies.path:}")
+    private String cookiesPath;
+
+    private final PlatformDetector platformDetector;
+
+    public MediaDownloadService(PlatformDetector platformDetector) {
+        this.platformDetector = platformDetector;
+    }
+
     @Getter
     public static class DownloadResult {
         private final boolean successful;
         private final File file;
         private final String title;
         private final String mediaType;
+        private final String notice;
         private final String error;
 
-        private DownloadResult(boolean successful, File file, String title, String mediaType, String error) {
+        private DownloadResult(boolean successful, File file, String title, String mediaType, String notice, String error) {
             this.successful = successful;
             this.file = file;
             this.title = title;
             this.mediaType = mediaType;
+            this.notice = notice;
             this.error = error;
         }
 
         public static DownloadResult success(File file, String title, String mediaType) {
-            return new DownloadResult(true, file, title, mediaType, null);
+            return new DownloadResult(true, file, title, mediaType, null, null);
+        }
+
+        public static DownloadResult success(File file, String title, String mediaType, String notice) {
+            return new DownloadResult(true, file, title, mediaType, notice, null);
         }
 
         public static DownloadResult failure(String error) {
-            return new DownloadResult(false, null, null, null, error);
+            return new DownloadResult(false, null, null, null, null, error);
         }
     }
 
@@ -57,6 +73,16 @@ public class MediaDownloadService {
     }
 
     public DownloadResult downloadAudio(String url) {
+        if (platformDetector.detect(url) == PlatformDetector.Platform.INSTAGRAM) {
+            DownloadResult videoResult = download(url, "video");
+            if (!videoResult.isSuccessful()) return videoResult;
+            return DownloadResult.success(
+                    videoResult.getFile(),
+                    videoResult.getTitle(),
+                    "video",
+                    "Instagram audio formatini qo'llab-quvvatlamaydi, video yuklandi"
+            );
+        }
         return download(url, "audio");
     }
 
@@ -74,51 +100,242 @@ public class MediaDownloadService {
         }
     }
 
+    public List<DownloadResult> splitAndDownload(String url, String type) {
+        // 1. Avval to'liq yuklash
+        DownloadResult result = download(url, type);
+        if (!result.isSuccessful()) return List.of(result);
+
+        long fileSizeBytes = result.getFile().length();
+        long maxBytes = 1024L * 1024 * 1024; // 1GB
+
+        // Fayl 1GB dan kichik bo'lsa bo'lish shart emas
+        if (fileSizeBytes <= maxBytes) {
+            return List.of(result);
+        }
+
+        // FFmpeg bilan qismlarga bo'lish
+        return splitVideo(result.getFile(), maxBytes);
+    }
+
+    private List<DownloadResult> splitVideo(File inputFile, long maxBytes) {
+        List<DownloadResult> parts = new ArrayList<>();
+        try {
+            // Video davomiyligini olish
+            long durationSecs = getVideoDuration(inputFile);
+            long fileSizeBytes = inputFile.length();
+
+            // Telegram Bot API 50MB limit — shuning uchun 40MB target
+            long targetPartBytes = 40L * 1024 * 1024; // 40MB
+            int partCount = (int) Math.ceil((double) fileSizeBytes / targetPartBytes);
+            long partDuration = durationSecs / partCount;
+
+            // Original fayl nomini olish
+            String originalName = inputFile.getName();
+            int dotIndex = originalName.lastIndexOf('.');
+            String baseName = (dotIndex > 0) ? originalName.substring(0, dotIndex) : originalName;
+
+            for (int i = 0; i < partCount; i++) {
+                long startTime = i * partDuration;
+                String outputPath = inputFile.getParent() +
+                        File.separator + "part_" + String.format("%02d", i+1) +
+                        "_of_" + String.format("%02d", partCount) + ".mp4";
+
+                List<String> cmd = new ArrayList<>(List.of(
+                        ffmpegPath,
+                        "-i", inputFile.getAbsolutePath(),
+                        "-ss", String.valueOf(startTime),
+                        "-t", String.valueOf(partDuration),
+                        "-c", "copy",
+                        "-y",
+                        outputPath
+                ));
+
+                ProcessBuilder pb = new ProcessBuilder(cmd);
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+                process.waitFor(120, TimeUnit.SECONDS);
+
+                File partFile = new File(outputPath);
+                if (partFile.exists() && partFile.length() > 0) {
+                    parts.add(DownloadResult.success(
+                            partFile,
+                            "📦 " + (i+1) + "/" + partCount + " qism — " + baseName,
+                            "video"
+                    ));
+                }
+            }
+
+            // Asl faylni o'chirish
+            inputFile.delete();
+
+        } catch (Exception e) {
+            log.error("Video splitting failed", e);
+            parts.add(DownloadResult.failure("Videoni bo'lishda xatolik: " + e.getMessage()));
+        }
+        return parts;
+    }
+
+    private long getVideoDuration(File videoFile) throws Exception {
+        List<String> cmd = List.of(
+                ffmpegPath, "-i", videoFile.getAbsolutePath()
+        );
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        byte[] output = process.getInputStream().readAllBytes();
+        process.waitFor(30, TimeUnit.SECONDS);
+
+        // Duration ni parse qilish: "Duration: HH:MM:SS.ms"
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("Duration: (\\d+):(\\d+):(\\d+)")
+                .matcher(new String(output));
+        if (m.find()) {
+            return Long.parseLong(m.group(1)) * 3600 +
+                    Long.parseLong(m.group(2)) * 60 +
+                    Long.parseLong(m.group(3));
+        }
+        return 0;
+    }
+
     private DownloadResult download(String url, String type) {
         File folder = createTempFolder();
 
         try {
+            String lowerUrl = url == null ? "" : url.toLowerCase();
+            boolean isTikTok = lowerUrl.contains("tiktok.com");
+
             List<String> command = new ArrayList<>();
             command.add(ytdlpPath);
+            command.add("--ffmpeg-location");
+            command.add(ffmpegPath);
 
             if ("audio".equals(type)) {
                 command.addAll(List.of("-x", "--audio-format", "mp3", "--audio-quality", "0"));
             } else {
-                command.addAll(List.of("-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"));
+                // Sifatni type dan olish
+                String height = "720"; // default
+                if (type.startsWith("video_")) {
+                    height = type.replace("video_", "");
+                }
+
+                // Format selector
+                String formatSelector = String.format(
+                    "bestvideo[ext=mp4][height<=%s]+bestaudio[ext=m4a]/" +
+                    "bestvideo[height<=%s]+bestaudio/best[height<=%s]/best",
+                    height, height, height
+                );
+                command.add("-f");
+                command.add(formatSelector);
+                command.add("--merge-output-format");
+                command.add("mp4");
             }
 
-            if (url.toLowerCase().contains("tiktok.com")) {
-                command.addAll(List.of("--extractor-args",
-                        "tiktok:api_hostname=api22-normal-c-alisg.tiktokv.com"));
+            if (isTikTok) {
+                // TikTok uchun impersonation (Chrome kabi ko'rinamiz)
+                command.add("--impersonate");
+                command.add("Chrome-133");
+
+                // Timeout oshirish
+                command.add("--socket-timeout");
+                command.add("90");
             }
+
+            if (lowerUrl.contains("snapchat.com")) {
+                command.add("--add-header");
+                command.add("User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15");
+                command.add("--add-header");
+                command.add("Accept-Language:en-US,en;q=0.9");
+                // Story va Spotlight URL larini qo'llab-quvvatlash uchun
+                command.add("--extractor-args");
+                command.add("snapchat:stories=yes");
+            }
+
+            if (lowerUrl.contains("likee.video")) {
+                // Short linkni oldin resolve qil
+                command.add("--no-playlist");
+                command.add("--extractor-args");
+                command.add("likee:app_name=likee");
+            }
+
+            // Cookies qo'shish (barcha platformalar uchun)
+            if (cookiesPath != null && !cookiesPath.isEmpty()) {
+                File cookiesFile = new File(cookiesPath);
+                if (cookiesFile.exists()) {
+                    command.add("--cookies");
+                    command.add(cookiesPath);
+                }
+            }
+
 
             command.addAll(List.of(
-                    "--max-filesize", maxFileSizeMb + "M",
+                    "--max-filesize", "500M",
                     "--no-check-certificates",
                     "-o", folder.getAbsolutePath() + "/%(title)s.%(ext)s",
                     url
             ));
 
-            ProcessBuilder pb = new ProcessBuilder(command);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
+            ProcessResult result = runProcess(command, url);
+            if (!result.finished) {
+                log.error("yt-dlp timeout. Output so far:\n{}", result.output);
+                return DownloadResult.failure(
+                    "Yuklab olish vaqti tugadi. Video juda uzun yoki katta bo'lishi mumkin (max 45MB)"
+                );
+            }
 
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
+            // Agar --impersonate chrome ishlamasa (yt-dlp versiyasiga bog'liq), fallback: User-Agent + Referer
+            if (isTikTok && result.exitCode != 0) {
+                String outLower = (result.output == null ? "" : result.output.toLowerCase());
+                if (outLower.contains("impersonation")
+                        || outLower.contains("--impersonate")
+                        || outLower.contains("unknown option")) {
+                    List<String> fallbackCommand = new ArrayList<>();
+                    for (int i = 0; i < command.size(); i++) {
+                        String c = command.get(i);
+                        if ("--impersonate".equals(c)) {
+                            i++; // skip value (e.g. chrome)
+                            continue;
+                        }
+                        fallbackCommand.add(c);
+                    }
+                    fallbackCommand.add("--add-header");
+                    fallbackCommand.add("User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
+                    fallbackCommand.add("--add-header");
+                    fallbackCommand.add("Referer:https://www.tiktok.com/");
+
+                    log.info("yt-dlp TikTok fallback (UA/Referer) command: {}", String.join(" ", fallbackCommand));
+                    result = runProcess(fallbackCommand, url);
+                    if (!result.finished) {
+                        log.error("yt-dlp timeout on TikTok fallback. Output so far:\n{}", result.output);
+                        return DownloadResult.failure(
+                            "Yuklab olish vaqti tugadi. Video juda uzun yoki katta bo'lishi mumkin (max 45MB)"
+                        );
+                    }
                 }
             }
 
-            boolean finished = process.waitFor(120, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                return DownloadResult.failure("Yuklab olish vaqti tugadi (120 sekund)");
+            // Fayl to'liq yozilishini kutish (max 5 sekund)
+            int waitCount = 0;
+            while (waitCount < 10) {
+                File[] currentFiles = folder.listFiles();
+                if (currentFiles != null) {
+                    File[] readyFiles = Arrays.stream(currentFiles)
+                            .filter(f -> !f.getName().endsWith(".part")
+                                    && !f.getName().endsWith(".ytdl"))
+                            .toArray(File[]::new);
+                    if (readyFiles.length > 0) break;
+                }
+                Thread.sleep(500);
+                waitCount++;
             }
 
-            if (process.exitValue() != 0) {
-                return DownloadResult.failure(parseError(output.toString()));
+            if (result.exitCode != 0) {
+                log.error("yt-dlp exited with code {}. Output:\n{}", result.exitCode, result.output);
+                return DownloadResult.failure(parseError(result.output));
+            } else {
+                String out = (result.output == null ? "" : result.output.trim());
+                if (!out.isEmpty()) {
+                    log.debug("yt-dlp output:\n{}", out);
+                }
             }
 
             File[] files = folder.listFiles();
@@ -126,7 +343,26 @@ public class MediaDownloadService {
                 return DownloadResult.failure("Fayl yuklab olinmadi");
             }
 
-            File downloadedFile = files[0];
+            File downloadedFile = Arrays.stream(files)
+                    .filter(f -> !f.getName().endsWith(".part")
+                            && !f.getName().endsWith(".ytdl"))
+                    .filter(f -> f.getName().endsWith(".mp4"))
+                    .findFirst()
+                    .orElseGet(() -> Arrays.stream(files)
+                            .filter(f -> !f.getName().endsWith(".part")
+                                    && !f.getName().endsWith(".ytdl")
+                                    && !f.getName().endsWith(".m4a")
+                                    && !f.getName().endsWith(".webm"))
+                            .findFirst()
+                            .orElse(null));
+
+            if (downloadedFile == null) {
+                return DownloadResult.failure("Fayl yuklab olinmadi yoki hali tugallanmadi");
+            }
+
+            log.info("Yuklangan fayl: {}, hajmi: {} MB",
+                    downloadedFile.getName(),
+                    downloadedFile.length() / 1024 / 1024);
             String title = downloadedFile.getName();
             int dotIndex = title.lastIndexOf('.');
             if (dotIndex > 0) {
@@ -181,21 +417,84 @@ public class MediaDownloadService {
     }
 
     private String parseError(String output) {
-        if (output.contains("Video unavailable")) return "Bu video mavjud emas yoki o'chirilgan";
-        if (output.contains("Private video")) return "Bu shaxsiy (private) video";
-        if (output.contains("Sign in")) return "Bu videoni ko'rish uchun tizimga kirish talab qilinadi";
-        if (output.contains("Geo-restricted")) return "Bu video sizning mintaqangizda mavjud emas";
-        if (output.contains("age")) return "Bu video yosh chegarasi bilan cheklangan";
-        if (output.contains("copyright")) return "Mualliflik huquqi tufayli video mavjud emas";
-        if (output.contains("File is larger")) return "Fayl hajmi juda katta (max " + maxFileSizeMb + "MB)";
-        if (output.contains("Unsupported URL")) return "Bu URL qo'llab-quvvatlanmaydi";
-        if (output.contains("HTTP Error 404")) return "Sahifa topilmadi (404)";
-        if (output.contains("HTTP Error 403")) return "Kirish taqiqlangan (403)";
+        String o = output == null ? "" : output.toLowerCase();
+
+        if (o.contains("video unavailable")) return "Bu video mavjud emas yoki o'chirilgan";
+        if (o.contains("private video")) return "Bu shaxsiy (private) video";
+        if (o.contains("sign in")) return "YouTube tizimga kirish talab qiladi. Boshqa video yuboring";
+        if (o.contains("cookies")) return "Bu video yuklab olish uchun login kerak";
+        if (o.contains("confirm your age")) return "Yoshga oid cheklov bor, yuklab bo'lmadi";
+        if (o.contains("geo-restricted")) return "Bu video sizning mintaqangizda mavjud emas";
+        if (o.contains("age-restricted") || o.contains("age restricted") || o.contains("age")) return "Bu video yosh chegarasi bilan cheklangan";
+        if (o.contains("copyright")) return "Mualliflik huquqi tufayli video mavjud emas";
+        if (o.contains("file is larger than max-filesize")) return "⚠️ Video hajmi 500MB dan katta.\nPastroq sifat tanlang: 360p yoki 480p";
+        if (o.contains("file is larger")) return "Fayl hajmi juda katta (max " + maxFileSizeMb + "MB)";
+        if (o.contains("unsupported url")) return "Bu turdagi havola qo'llab-quvvatlanmaydi. Boshqa havola yuboring";
+        if (o.contains("timed out") || o.contains("timeout")) return "Ulanish vaqti tugadi. Qayta urinib ko'ring";
+        if (o.contains("impersonation")) return "TikTok hozir band. Bir oz kutib qayta urinib ko'ring";
+        if (o.contains("http error 404")) return "Sahifa topilmadi (404)";
+        if (o.contains("http error 403")) return "Kirish taqiqlangan (403)";
         return "Yuklab olishda xato yuz berdi. Qayta urinib ko'ring.";
     }
 
+    private static class ProcessResult {
+        private final boolean finished;
+        private final int exitCode;
+        private final String output;
+
+        private ProcessResult(boolean finished, int exitCode, String output) {
+            this.finished = finished;
+            this.exitCode = exitCode;
+            this.output = output;
+        }
+    }
+
+    private ProcessResult runProcess(List<String> command, String url) throws IOException, InterruptedException {
+        log.info("yt-dlp command: {}", String.join(" ", command));
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+
+        StringBuilder output = new StringBuilder();
+        Thread outputReader = new Thread(() -> {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append("\n");
+                }
+            } catch (IOException e) {
+                log.warn("Failed to read yt-dlp output: {}", e.getMessage());
+            }
+        }, "ytdlp-output-reader");
+        outputReader.setDaemon(true);
+        outputReader.start();
+
+        // YouTube uchun 600 sekund (10 daqiqa), boshqalar 180 sekund
+        long timeout = 180;
+        if (url != null && (url.contains("youtube.com") || url.contains("youtu.be"))) {
+            timeout = 600;
+        }
+
+        boolean finished = process.waitFor(timeout, TimeUnit.SECONDS);
+        if (!finished) {
+            process.destroyForcibly();
+            return new ProcessResult(false, -1, output.toString());
+        }
+
+        try {
+            outputReader.join(TimeUnit.SECONDS.toMillis(2));
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+
+        return new ProcessResult(true, process.exitValue(), output.toString());
+    }
+
     private File createTempFolder() {
-        File folder = new File(tempDir, UUID.randomUUID().toString());
+        File tempBase = new File(tempDir);
+        if (!tempBase.exists()) tempBase.mkdirs();
+
+        File folder = new File(tempBase, UUID.randomUUID().toString());
         folder.mkdirs();
         return folder;
     }
