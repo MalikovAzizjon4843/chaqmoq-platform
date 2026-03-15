@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.bots.TelegramLongPollingBot;
 import org.telegram.telegrambots.meta.api.methods.GetFile;
 import org.telegram.telegrambots.meta.api.methods.send.*;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
 import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
 import org.telegram.telegrambots.meta.api.objects.*;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
@@ -132,37 +133,33 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
             }
 
             // Private chatda buyruqlar va matn qidirish
-            switch (text) {
-                case "/start" -> handleStart(chatId, message.getFrom());
-                case "/help", "❓ Yordam" -> handleHelp(chatId);
-                case "/stats", "📊 Statistika" -> handleStats(chatId);
-                case "/admin" -> handleAdmin(chatId, userId);
-                case "📥 Video Yuklab olish" -> sendText(chatId,
-                        "📥 *Video yuklab olish*\n\n" +
-                        "Quyidagi platformalardan video havolasini yuboring:\n\n" +
-                        "🎬 YouTube\n🎵 TikTok\n📸 Instagram\n📘 Facebook\n" +
-                        "🐦 Twitter/X\n👻 Snapchat\n📌 Pinterest\n🧵 Threads\n❤️ Likee\n\n" +
-                        "Havola yuboring va men yuklab beraman! ⚡");
-                case "🎵 Musiqa Izlash" -> sendText(chatId,
-                        "🎵 *Musiqa izlash*\n\n" +
-                        "Menga audio yoki ovozli xabar yuboring, men musiqani aniqlab beraman!\n\n" +
-                        "📌 Qo'shiq nomi, ijrochi va Spotify/Apple Music havolasini topaman.");
-                default -> {
-                    if (platformDetector.isValidUrl(text)) {
-                        handleDownloadRequest(chatId, text);
-                    } else {
-                        // Matn orqali qo'shiq qidirish
-                        if (auddApiKey != null && !auddApiKey.isEmpty()) {
-                            try {
-                                handleMusicSearch(chatId, text);
-                            } catch (TelegramApiException e) {
-                                logger.error("Error searching music: {}", e.getMessage());
-                            }
+            try {
+                switch (text) {
+                    case "/start" -> handleStart(chatId, message.getFrom());
+                    case "/help", "❓ Yordam" -> handleHelp(chatId);
+                    case "/stats", "📊 Statistika" -> handleStats(chatId);
+                    case "/admin" -> handleAdmin(chatId, userId);
+                    case "📥 Video Yuklab olish" -> handleVideoHelp(chatId);
+                    case "🎵 Musiqa Izlash" -> handleMusicHelp(chatId);
+                    default -> {
+                        if (platformDetector.isValidUrl(text)) {
+                            handleDownloadRequest(chatId, text);
                         } else {
-                            sendText(chatId, "🤔 Havola yuboring yoki /help ni bosing");
+                            // Matn orqali qo'shiq qidirish
+                            if (auddApiKey != null && !auddApiKey.isEmpty()) {
+                                try {
+                                    handleMusicSearch(chatId, text);
+                                } catch (TelegramApiException e) {
+                                    logger.error("Error searching music: {}", e.getMessage());
+                                }
+                            } else {
+                                sendText(chatId, "🤔 Havola yuboring yoki /help ni bosing");
+                            }
                         }
                     }
                 }
+            } catch (TelegramApiException e) {
+                logger.error("Error handling message: {}", e.getMessage());
             }
         }
     }
@@ -220,7 +217,7 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
             row3.add(InlineKeyboardButton.builder().text("⭕ Video Xabar (Dumaloq)").callbackData(roundCallback).build());
             rows.add(row3);
         } else {
-            // Boshqa platformalar uchun avvalgidek
+            // Boshqa platformalar uchun
             String videoCallback = urlCacheService.createCallbackData("dl_video", url);
             String audioCallback = urlCacheService.createCallbackData("dl_audio", url);
             String roundCallback = urlCacheService.createCallbackData("dl_round", url);
@@ -300,9 +297,10 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
             default -> "video";
         };
 
-        editMessage(chatId, messageId, "⏳ " + platform.getEmoji() + " " + typeName + " yuklanmoqda...\n\nBiroz kuting...");
-
         try {
+            // 1. Progress xabarini yuborish
+            Message progressMsg = sendProgressMessage(chatId, type);
+            
             List<MediaDownloadService.DownloadResult> results;
             
             // Round video uchun alohida metod
@@ -311,10 +309,22 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
                 MediaDownloadService.DownloadResult roundResult = 
                     mediaDownloadService.downloadAsRoundVideo(url);
                 results = List.of(roundResult);
+            } else if ("audio".equals(type)) {
+                // Audio uchun downloadAudio()
+                logger.info("processDownload: audio type detected");
+                MediaDownloadService.DownloadResult audioResult = 
+                    mediaDownloadService.downloadAudio(url);
+                results = List.of(audioResult);
             } else {
-                // Boshqa type'lar uchun splitAndDownload
-                results = mediaDownloadService.splitAndDownload(url, type);
+                // Video types: video, video_360, video_480, video_720, video_1080
+                logger.info("processDownload: video type={} detected, calling downloadVideo()", type);
+                MediaDownloadService.DownloadResult videoResult = 
+                    mediaDownloadService.downloadVideo(url, type);
+                results = List.of(videoResult);
             }
+
+            // 3. Progress xabarini o'chirish
+            deleteMessage(chatId, progressMsg.getMessageId());
 
             // Har bir qismni yuborish
             int total = results.size();
@@ -329,13 +339,14 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
             for (int i = 0; i < total; i++) {
                 MediaDownloadService.DownloadResult result = results.get(i);
                 if (!result.isSuccessful()) {
-                    editMessage(chatId, messageId, "❌ " + result.getError());
+                    String errorText = getErrorText(result.getError());
+                    sendText(chatId, errorText);
                     userService.recordDownload(userId, url, platform.getName(), type, false, result.getError());
                     continue;
                 }
 
                 if (total > 1) {
-                    editMessage(chatId, messageId, "📦 Qism " + (i+1) + "/" + total + " yuborilmoqda...");
+                    sendText(chatId, "📦 Qism " + (i+1) + "/" + total + " yuborilmoqda...");
                 }
 
                 try {
@@ -351,14 +362,14 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
 
             if (total > 0 && results.get(total - 1).isSuccessful()) {
                 if (results.get(total - 1).getNotice() != null && !results.get(total - 1).getNotice().isBlank()) {
-                    editMessage(chatId, messageId, "✅ " + platform.getEmoji() + " Muvaffaqiyatli yuklandi!\n\nℹ️ " + results.get(total - 1).getNotice());
+                    sendText(chatId, "✅ " + platform.getEmoji() + " Muvaffaqiyatli yuklandi!\n\nℹ️ " + results.get(total - 1).getNotice());
                 } else {
-                    editMessage(chatId, messageId, "✅ " + platform.getEmoji() + " Muvaffaqiyatli yuklandi!");
+                    sendText(chatId, "✅ " + platform.getEmoji() + " Muvaffaqiyatli yuklandi!");
                 }
             }
         } catch (Exception e) {
             logger.error("Download processing error: {}", e.getMessage(), e);
-            editMessage(chatId, messageId, "❌ Xatolik yuz berdi: " + e.getMessage());
+            sendText(chatId, "❌ Xatolik yuz berdi: " + e.getMessage());
             userService.recordDownload(userId, url, platform.getName(), type, false, e.getMessage());
         }
     }
@@ -385,11 +396,11 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
                 send.setChatId(chatId.toString());
                 send.setAudio(inputFile);
                 send.setTitle(title);
-                send.setCaption("🎵 " + title);
+                send.setCaption("✅ " + getTypeEmoji("audio") + " | ⚡ @" + botUsername);
                 execute(send);
             }
-            case "video" -> sendVideoFile(chatId, file, "⚡ @" + botUsername);
-            default -> sendVideoFile(chatId, file, "⚡ @" + botUsername);
+            case "video" -> sendVideoFile(chatId, file, "✅ " + getTypeEmoji("video") + " | ⚡ @" + botUsername);
+            default -> sendVideoFile(chatId, file, "✅ " + getTypeEmoji(type) + " | ⚡ @" + botUsername);
         }
     }
 
@@ -410,11 +421,24 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
                 send.setChatId(chatId.toString());
                 send.setAudio(inputFile);
                 send.setTitle(title);
-                send.setCaption("📦 " + partNumber + "/" + totalParts + " qism\n🎵 " + title);
+                String caption = totalParts > 1 ? 
+                    "📦 " + partNumber + "/" + totalParts + " qism\n🎵 " + title :
+                    "✅ " + getTypeEmoji("audio") + " | ⚡ @" + botUsername;
+                send.setCaption(caption);
                 execute(send);
             }
-            case "video" -> sendVideoFile(chatId, file, "📦 " + partNumber + "/" + totalParts + " qism\n⚡ @" + botUsername);
-            default -> sendVideoFile(chatId, file, "📦 " + partNumber + "/" + totalParts + " qism\n⚡ @" + botUsername);
+            case "video" -> {
+                String caption = totalParts > 1 ? 
+                    "📦 " + partNumber + "/" + totalParts + " qism\n⚡ @" + botUsername :
+                    "✅ " + getTypeEmoji("video") + " | ⚡ @" + botUsername;
+                sendVideoFile(chatId, file, caption);
+            }
+            default -> {
+                String caption = totalParts > 1 ? 
+                    "📦 " + partNumber + "/" + totalParts + " qism\n⚡ @" + botUsername :
+                    "✅ " + getTypeEmoji(type) + " | ⚡ @" + botUsername;
+                sendVideoFile(chatId, file, caption);
+            }
         }
     }
 
@@ -560,36 +584,27 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
     }
 
     private void handleStart(Long chatId, User user) {
-        String name = user.getFirstName() != null ? user.getFirstName() : "Foydalanuvchi";
-        String text = """
-            🔥 *Assalomu alaykum, %s!*
-            
-            ⚡ *@%s* ga xush kelibsiz!
-            
-            📥 *Yuklab olish mumkin:*
-            • 📸 Instagram — post, reel, stories
-            • 🎵 TikTok — watermarksiz
-            • 🎬 YouTube — video, shorts
-            • 👤 Facebook — video
-            • 🐦 X (Twitter) — video, gif
-            • 📌 Pinterest — video, rasm
-            
-            🎵 *Shazam funksiyasi:*
-            • Qo'shiq nomi yoki ijrochi ismi
-            • Audio, ovozli xabar, video
-            • TikTok/YouTube havolasi
-            
-            ⭕ *Round video* — dumaloq formatga o'girish
-            
-            😎 *Bot guruhlarda ham ishlaydi!*
-            
-            🚀 Havola yuboring — yuklab beraman!
-            """.formatted(escapeMarkdown(name), botUsername);
+        String firstName = user.getFirstName() != null ? user.getFirstName() : "Foydalanuvchi";
+        String text = "⚡ Assalomu alaykum, " + firstName + "!\n\n" +
+            "🎬 Men sizga ijtimoiy tarmoqlardan video va " +
+            "musiqa yuklab olishda yordam beraman!\n\n" +
+            "📥 Ishlaydigan platformalar:\n" +
+            "• 🎬 YouTube — video, shorts\n" +
+            "• 📸 Instagram — post, reel\n" +
+            "• 🎵 TikTok — watermarksiz\n" +
+            "• 👤 Facebook — video\n" +
+            "• 🐦 Twitter/X — video, gif\n" +
+            "• 📌 Pinterest — video, rasm\n\n" +
+            "🎵 Shazam — musiqa tanish:\n" +
+            "• Audio, video, ovozli xabar yuboring\n" +
+            "• Qo'shiq nomi yoki ijrochi yozing\n\n" +
+            "⭕ Round video — dumaloq formatga o'girish\n\n" +
+            "😎 Bot guruhlarda ham ishlaydi!\n\n" +
+            "🚀 Havola yuboring — yuklab beraman!";
 
         SendMessage msg = new SendMessage();
         msg.setChatId(chatId.toString());
         msg.setText(text);
-        msg.setParseMode("Markdown");
         msg.setReplyMarkup(getMainKeyboard());
 
         try {
@@ -599,32 +614,91 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
         }
     }
 
-    private void handleHelp(Long chatId) {
-        String text = "📖 *Qo'llanma*\n\n" +
-                "📥 *Video yuklab olish:*\n" +
-                "Menga quyidagi platformalardan havola yuboring:\n" +
-                "🎬 YouTube  🎵 TikTok  📸 Instagram\n" +
-                "📘 Facebook  🐦 Twitter/X\n" +
-                "📌 Pinterest\n\n" +
-                "🎵 *Musiqa aniqlash:*\n" +
-                "Audio yoki ovozli xabar yuboring — men musiqani topaman!\n\n" +
-                "📋 *Buyruqlar:*\n" +
-                "/start — Botni ishga tushirish\n" +
-                "/help — Qo'llanma\n" +
-                "/stats — Statistika";
+    private void handleVideoHelp(Long chatId) {
+        String text = """
+        🎬 *Video yuklab olish*
+        
+        Quyidagi platformalardan video havolasini yuboring:
+        
+        🎬 YouTube — video, shorts
+        📸 Instagram — post, reel
+        🎵 TikTok — watermarksiz
+        👤 Facebook — video
+        🐦 Twitter/X — video, gif
+        📌 Pinterest — video, rasm
+        
+        Havola yuboring — men yuklab beraman! ⚡
+        """;
 
         sendText(chatId, text);
     }
 
-    private void handleStats(Long chatId) {
-        long totalUsers = userService.getTotalUsers();
-        long totalDownloads = userService.getTotalDownloads();
-
-        String text = "📊 *Statistika*\n\n" +
-                "👥 Jami foydalanuvchilar: *" + totalUsers + "*\n" +
-                "📥 Jami yuklab olishlar: *" + totalDownloads + "*";
+    private void handleMusicHelp(Long chatId) {
+        String text = """
+        🎵 *Musiqa izlash*
+        
+        Quyidagilardan birini yuboring:
+        • 🎤 Audio fayl yoki ovozli xabar
+        • 🎬 Video (musiqasini taniydi)
+        • ⭕ Video xabar (dumaloq)
+        • ✍️ Qo'shiq nomi yoki ijrochi ismi
+        
+        Men qo'shiq nomini, ijrochini va 
+        Spotify/YouTube havolasini topaman! 🎧
+        """;
 
         sendText(chatId, text);
+    }
+
+    private void handleHelp(Long chatId) {
+        String text = """
+        📖 *Qo'llanma*
+        
+        📥 *Video yuklab olish:*
+        Menga quyidagi platformalardan havola yuboring:
+        • 🎬 YouTube  📸 Instagram  🎵 TikTok
+        • 👤 Facebook  🐦 Twitter/X  📌 Pinterest
+        
+        🎵 *Musiqa aniqlash (Shazam):*
+        • Audio yoki ovozli xabar yuboring
+        • Video yuboring — musiqasini topaman
+        • Qo'shiq nomi yoki ijrochi ismini yozing
+        
+        ⭕ *Round video:*
+        Video havolasini yuboring → Round Video tugmasini bosing
+        
+        📋 *Buyruqlar:*
+        /start — Botni ishga tushurish
+        /help — Qo'llanma
+        /stats — Statistika
+        
+        😎 *Bot guruhlarda ham ishlaydi!*
+        """;
+
+        sendText(chatId, text);
+    }
+
+    private void handleStats(Long chatId) throws TelegramApiException {
+        long totalUsers = userService.getTotalUsers();
+        long totalDownloads = userService.getTotalDownloads();
+        long todayDownloads = userService.getTodayDownloads();
+        long successDownloads = userService.getSuccessDownloads();
+        long failedDownloads = userService.getFailedDownloads();
+
+        String text = "📊 Bot Statistikasi\n\n" +
+            "👥 Foydalanuvchilar:\n" +
+            "• Jami: " + totalUsers + " nafar\n\n" +
+            "📥 Yuklab olishlar:\n" +
+            "• Jami: " + totalDownloads + " ta\n" +
+            "• Bugun: " + todayDownloads + " ta\n" +
+            "• Muvaffaqiyatli: " + successDownloads + " ta\n" +
+            "• Xatolik: " + failedDownloads + " ta\n\n" +
+            "⚡ @" + botUsername;
+
+        SendMessage msg = new SendMessage();
+        msg.setChatId(chatId.toString());
+        msg.setText(text);
+        execute(msg);
     }
 
     private void handleAdmin(Long chatId, Long userId) {
@@ -647,20 +721,18 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
 
     private ReplyKeyboardMarkup getMainKeyboard() {
         KeyboardRow row1 = new KeyboardRow();
-        row1.add(new KeyboardButton("📥 Video Yuklab olish"));
-        row1.add(new KeyboardButton("🎵 Musiqa Izlash"));
+        row1.add("📥 Video Yuklab olish");
+        row1.add("🎵 Musiqa Izlash");
 
         KeyboardRow row2 = new KeyboardRow();
-        row2.add(new KeyboardButton("📊 Statistika"));
-        row2.add(new KeyboardButton("❓ Yordam"));
+        row2.add("📊 Statistika");
+        row2.add("❓ Yordam");
 
-        ReplyKeyboardMarkup markup = ReplyKeyboardMarkup.builder()
-                .keyboard(List.of(row1, row2))
-                .resizeKeyboard(true)
-                .isPersistent(true)
-                .build();
-
-        return markup;
+        ReplyKeyboardMarkup keyboard = new ReplyKeyboardMarkup();
+        keyboard.setKeyboard(List.of(row1, row2));
+        keyboard.setResizeKeyboard(true);
+        keyboard.setOneTimeKeyboard(false);
+        return keyboard;
     }
 
     private boolean isAdmin(Long userId) {
@@ -712,6 +784,99 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
                 .replace("*", "\\*")
                 .replace("[", "\\[")
                 .replace("`", "\\`");
+    }
+
+    private Message sendProgressMessage(Long chatId, String type) 
+            throws TelegramApiException {
+        String emoji;
+        String text;
+        switch (type) {
+            case "audio" -> {
+                emoji = "🎵";
+                text = "Audio yuklanmoqda...";
+            }
+            case "round" -> {
+                emoji = "⭕";
+                text = "Dumaloq video tayyorlanmoqda...";
+            }
+            case "video_1080" -> {
+                emoji = "🎬";
+                text = "1080p video yuklanmoqda...";
+            }
+            case "video_720" -> {
+                emoji = "🎬";
+                text = "720p video yuklanmoqda...";
+            }
+            case "video_480" -> {
+                emoji = "🎬";
+                text = "480p video yuklanmoqda...";
+            }
+            case "video_360" -> {
+                emoji = "🎬";
+                text = "360p video yuklanmoqda...";
+            }
+            default -> {
+                emoji = "📥";
+                text = "Yuklanmoqda...";
+            }
+        }
+        SendMessage msg = new SendMessage();
+        msg.setChatId(chatId.toString());
+        msg.setText(emoji + " " + text);
+        return execute(msg);
+    }
+
+    private String getErrorText(String msg) {
+        if (msg == null) return "❌ Yuklab olishda xatolik.";
+        
+        if (msg.contains("50MB dan katta")) {
+            return "⚠️ Video hajmi 50MB dan katta.\n\n" +
+                "💡 Pastroq sifat tanlang:\n" +
+                "360p yoki 480p ni sinab ko'ring";
+        } else if (msg.contains("timeout") || msg.contains("vaqti tugadi")) {
+            return "⏱ Yuklab olish vaqti tugadi.\n\n" +
+                "💡 Maslahat:\n" +
+                "• Pastroq sifat tanlang\n" +
+                "• Keyinroq qayta urinib ko'ring";
+        } else if (msg.contains("Private") || msg.contains("private")) {
+            return "🔒 Bu video yopiq (private).\n" +
+                "Faqat ochiq videolarni yuklab olish mumkin.";
+        } else if (msg.contains("age") || msg.contains("yosh chegarasi")) {
+            return "🔞 Bu video yosh chegarasi bilan cheklangan.";
+        } else if (msg.contains("not found") || msg.contains("topilmadi")) {
+            return "❌ Video topilmadi.\n" +
+                "Havola to'g'riligini tekshiring.";
+        } else {
+            return "❌ Yuklab olishda xatolik.\n\n" +
+                "💡 Maslahat:\n" +
+                "• Havolani tekshiring\n" +
+                "• Keyinroq qayta urinib ko'ring\n" +
+                "• Pastroq sifat tanlang";
+        }
+    }
+
+    private String getTypeEmoji(String type) {
+        return switch (type) {
+            case "audio" -> "🎵 Audio";
+            case "round" -> "⭕ Round video";
+            case "video_1080" -> "🎬 1080p";
+            case "video_720" -> "🎬 720p";
+            case "video_480" -> "🎬 480p";
+            case "video_360" -> "🎬 360p";
+            default -> "🎬 Video";
+        };
+    }
+
+    private void deleteMessage(Long chatId, Integer messageId) {
+        try {
+            DeleteMessage delete = new DeleteMessage();
+            delete.setChatId(chatId.toString());
+            delete.setMessageId(messageId);
+            execute(delete);
+        } catch (Exception e) {
+            // O'chirib bo'lmasa — ignore
+            logger.debug("Could not delete message: {}", e.getMessage());
+        }
     }
 
     private String getToken() {

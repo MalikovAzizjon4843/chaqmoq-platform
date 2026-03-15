@@ -17,6 +17,8 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 @Service
 @Slf4j
@@ -30,6 +32,9 @@ public class MusicRecognitionService {
 
     @Value("${acrcloud.host:identify-eu-west-1.acrcloud.com}")
     private String host;
+
+    @Value("${ffmpeg.path:/usr/bin/ffmpeg}")
+    private String ffmpegPath;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -73,7 +78,7 @@ public class MusicRecognitionService {
         }
     }
 
-    public MusicResult recognizeFromFile(File audioFile) {
+    public MusicResult recognizeFromFile(File inputFile) {
         if (accessKey == null || accessKey.isEmpty()) {
             log.warn("ACRCloud API key not configured");
             MusicResult r = new MusicResult();
@@ -81,39 +86,45 @@ public class MusicRecognitionService {
             return r;
         }
 
+        File audioSample = null;
         try {
+            // Har doim audio sample ajrat (video yoki audio bo'lsin)
+            log.info("Extracting 15-second audio sample from: {}", inputFile.getName());
+            audioSample = extractAudioSample(inputFile);
+
             long timestamp = System.currentTimeMillis() / 1000;
             String dataType = "audio";
             String signatureVersion = "1";
 
-            // Signature string to'g'ri format:
-            // "HTTP_METHOD\nHTTP_URI\nACCESS_KEY\nDATA_TYPE\nSIG_VERSION\nTIMESTAMP"
-            String stringToSign = "POST" + "\n" +
-                    "/v1/identify" + "\n" +
-                    accessKey + "\n" +
-                    dataType + "\n" +
-                    signatureVersion + "\n" +
+            // Signature string format (Python dan to'g'ridan-to'g'ri)
+            // "POST\n/v1/identify\naccess_key\naudio\n1\ntimestamp"
+            String stringToSign = "POST\n/v1/identify\n" + 
+                    accessKey + "\n" + 
+                    dataType + "\n" + 
+                    signatureVersion + "\n" + 
                     timestamp;
 
-            log.info("String to sign: [{}]", stringToSign);
-            log.info("Access key: [{}]", accessKey);
-            log.info("Host: [{}]", host);
+            log.info("ACRCloud signature components:");
+            log.info("  Host: {}", host);
+            log.info("  Timestamp: {}", timestamp);
+            log.info("  Sample file: {} ({}KB)", audioSample.getName(), audioSample.length() / 1024);
+            log.info("  String to sign:\n{}", stringToSign.replace("\n", "\\n"));
 
             String signature = hmacSha1(stringToSign, accessSecret);
-            log.info("Signature: [{}]", signature);
+            log.info("  Signature: {}", signature);
 
             try (CloseableHttpClient client = HttpClients.createDefault()) {
                 String url = "https://" + host + "/v1/identify";
-                log.info("ACRCloud URL: {}", url);
+                log.info("POST request to: {}", url);
 
                 HttpPost post = new HttpPost(url);
 
                 MultipartEntityBuilder builder =
                         MultipartEntityBuilder.create();
                 builder.addPart("sample",
-                        new FileBody(audioFile,
+                        new FileBody(audioSample,
                                 ContentType.APPLICATION_OCTET_STREAM,
-                                audioFile.getName()));
+                                audioSample.getName()));
                 builder.addPart("access_key",
                         new StringBody(accessKey, ContentType.TEXT_PLAIN));
                 builder.addPart("data_type",
@@ -124,7 +135,7 @@ public class MusicRecognitionService {
                 builder.addPart("signature",
                         new StringBody(signature, ContentType.TEXT_PLAIN));
                 builder.addPart("sample_bytes",
-                        new StringBody(String.valueOf(audioFile.length()),
+                        new StringBody(String.valueOf(audioSample.length()),
                                 ContentType.TEXT_PLAIN));
                 builder.addPart("timestamp",
                         new StringBody(String.valueOf(timestamp),
@@ -145,7 +156,64 @@ public class MusicRecognitionService {
             MusicResult r = new MusicResult();
             r.found = false;
             return r;
+        } finally {
+            // Temp audio sample faylni o'chir
+            if (audioSample != null && audioSample.exists()) {
+                if (audioSample.delete()) {
+                    log.debug("Temporary audio sample deleted: {}", audioSample.getName());
+                } else {
+                    log.warn("Failed to delete temporary audio sample: {}", audioSample.getAbsolutePath());
+                }
+            }
         }
+    }
+
+    private File extractAudioSample(File inputFile) throws Exception {
+        String outputPath = inputFile.getParent() + 
+            java.io.File.separator + "sample_" + System.currentTimeMillis() + ".mp3";
+        
+        List<String> cmd = new java.util.ArrayList<>(List.of(
+            ffmpegPath,
+            "-i", inputFile.getAbsolutePath(),
+            "-t", "15",        // faqat 15 sekund
+            "-vn",             // video track yo'q
+            "-ar", "44100",    // sample rate
+            "-ac", "2",        // stereo
+            "-b:a", "128k",    // bitrate - kichik fayl uchun
+            "-f", "mp3",
+            "-y",
+            outputPath
+        ));
+        
+        log.info("Extracting 15-second audio sample: {}", String.join(" ", cmd));
+        
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.redirectErrorStream(true);
+        Process process = pb.start();
+        
+        boolean finished = process.waitFor(30, TimeUnit.SECONDS);
+        if (!finished) {
+            process.destroyForcibly();
+            log.error("FFmpeg audio extraction timeout");
+            throw new Exception("FFmpeg audio extraction timeout");
+        }
+        
+        if (process.exitValue() != 0) {
+            log.error("FFmpeg extraction failed with exit code: {}", process.exitValue());
+            throw new Exception("FFmpeg extraction failed with exit code: " + process.exitValue());
+        }
+        
+        File sampleFile = new File(outputPath);
+        if (!sampleFile.exists() || sampleFile.length() == 0) {
+            log.error("Audio sample extraction produced no output");
+            throw new Exception("Audio sample extraction failed - empty output");
+        }
+        
+        log.info("Audio sample extracted successfully: {} ({}KB)", 
+            sampleFile.getName(), 
+            sampleFile.length() / 1024);
+        
+        return sampleFile;
     }
 
     private String hmacSha1(String data, String key) throws Exception {
@@ -172,7 +240,7 @@ public class MusicRecognitionService {
 
             JsonNode music = root.path("metadata")
                     .path("music");
-            if (!music.isArray() || music.size() == 0) {
+            if (!music.isArray() || music.isEmpty()) {
                 result.found = false;
                 return result;
             }
@@ -182,7 +250,7 @@ public class MusicRecognitionService {
             result.title = song.path("title").asText();
 
             JsonNode artists = song.path("artists");
-            if (artists.isArray() && artists.size() > 0) {
+            if (artists.isArray() && !artists.isEmpty()) {
                 result.artist = artists.get(0).path("name").asText();
             }
 
@@ -221,6 +289,7 @@ public class MusicRecognitionService {
 
     // ACRCloud text search yo'q — foydalanuvchi matn yuborganda
     // keyinroq YouTube search orqali qidirish qo'shiladi
+    @SuppressWarnings("unused")
     public MusicResult searchByText(String query) {
         // Hozircha oddiy javob — keyinroq YouTube search qo'shiladi
         MusicResult result = new MusicResult();

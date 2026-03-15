@@ -36,12 +36,12 @@ public class PlatformDetector {
         if (lower.contains("facebook.com") || lower.contains("fb.watch")) return Platform.FACEBOOK;
         if (lower.contains("twitter.com") || lower.contains("x.com")) return Platform.TWITTER;
         if (lower.contains("pinterest.com") || lower.contains("pin.it")) return Platform.PINTEREST;
-        if (lower.contains("snapchat.com")) return Platform.UNSUPPORTED;
         if (lower.contains("threads.net") || lower.contains("threads.com")) return Platform.UNSUPPORTED;
         if (lower.contains("likee.video") || lower.contains("l.likee.video") || lower.contains("likee.com")) return Platform.UNSUPPORTED;
 
         return Platform.UNKNOWN;
     }
+
 
     public boolean isValidUrl(String text) {
         return text != null && (text.startsWith("http://") || text.startsWith("https://"));

@@ -34,9 +34,11 @@ public class MediaDownloadService {
     private String currentDownloadType;
 
     private final PlatformDetector platformDetector;
+    private final CobaltDownloadService cobaltDownloadService;
 
-    public MediaDownloadService(PlatformDetector platformDetector) {
+    public MediaDownloadService(PlatformDetector platformDetector, CobaltDownloadService cobaltDownloadService) {
         this.platformDetector = platformDetector;
+        this.cobaltDownloadService = cobaltDownloadService;
     }
 
     @Getter
@@ -71,7 +73,14 @@ public class MediaDownloadService {
     }
 
     public DownloadResult downloadVideo(String url) {
-        return download(url, "video");
+        return downloadVideo(url, "video");
+    }
+
+    public DownloadResult downloadVideo(String url, String type) {
+        // Boshqa platformalar uchun split and download
+        return splitAndDownload(url, type).stream()
+            .findFirst()
+            .orElse(DownloadResult.failure("Video yuklab olinmadi"));
     }
 
     public DownloadResult downloadAudio(String url) {
@@ -96,7 +105,9 @@ public class MediaDownloadService {
         // 2. FFmpeg bilan crop + compress (384x384, max 11MB)
         try {
             File roundFile = convertToRoundVideo(raw.getFile());
-            raw.getFile().delete(); // asl faylni o'chir
+            if (raw.getFile().delete()) {
+                log.debug("Original video file deleted after round conversion");
+            }
             return DownloadResult.success(roundFile, raw.getTitle(), "round");
         } catch (Exception e) {
             log.error("Round video conversion failed", e);
@@ -170,7 +181,9 @@ public class MediaDownloadService {
             }
 
             // Asl faylni o'chirish
-            inputFile.delete();
+            if (inputFile.delete()) {
+                log.debug("Original file deleted after splitting");
+            }
 
         } catch (Exception e) {
             log.error("Video splitting failed", e);
@@ -202,11 +215,15 @@ public class MediaDownloadService {
     }
 
     private DownloadResult download(String url, String type) {
+        if (url == null || url.isEmpty()) {
+            return DownloadResult.failure("Havola bo'sh");
+        }
+        
         this.currentDownloadType = type;
         File folder = createTempFolder();
 
         try {
-            String lowerUrl = url == null ? "" : url.toLowerCase();
+            String lowerUrl = url.toLowerCase();
             boolean isTikTok = lowerUrl.contains("tiktok.com");
 
             List<String> command = new ArrayList<>();
@@ -447,7 +464,9 @@ public class MediaDownloadService {
             p2.waitFor(120, TimeUnit.SECONDS);
             
             if (p2.exitValue() == 0) {
-                roundFile.delete();
+                if (roundFile.delete()) {
+                    log.debug("Original round video deleted after recompression");
+                }
                 roundFile = new File(outputPath2);
                 log.info("Round video recompressed: {}MB",
                     roundFile.length() / 1024 / 1024);
@@ -553,10 +572,16 @@ public class MediaDownloadService {
 
     private File createTempFolder() {
         File tempBase = new File(tempDir);
-        if (!tempBase.exists()) tempBase.mkdirs();
+        if (!tempBase.exists()) {
+            if (tempBase.mkdirs()) {
+                log.debug("Temp base directory created: {}", tempDir);
+            }
+        }
 
         File folder = new File(tempBase, UUID.randomUUID().toString());
-        folder.mkdirs();
+        if (folder.mkdirs()) {
+            log.debug("Download folder created: {}", folder.getAbsolutePath());
+        }
         return folder;
     }
 

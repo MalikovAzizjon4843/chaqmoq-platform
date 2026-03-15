@@ -5,6 +5,7 @@ import org.springframework.stereotype.Service;
 import org.telegram.telegrambots.meta.api.objects.User;
 import uz.chaqmoq.media.model.*;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.Optional;
 
@@ -89,5 +90,21 @@ public class UserService {
             user.setState(state);
             userRepository.save(user);
         });
+    }
+
+    public long getTodayDownloads() {
+        LocalDate today = LocalDate.now();
+        LocalDateTime startOfDay = today.atStartOfDay();
+        LocalDateTime endOfDay = today.atTime(23, 59, 59);
+        return downloadHistoryRepository
+            .countByCreatedAtBetween(startOfDay, endOfDay);
+    }
+
+    public long getSuccessDownloads() {
+        return downloadHistoryRepository.countBySuccessTrue();
+    }
+
+    public long getFailedDownloads() {
+        return downloadHistoryRepository.countBySuccessFalse();
     }
 }
