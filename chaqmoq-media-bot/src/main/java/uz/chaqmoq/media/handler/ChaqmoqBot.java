@@ -1,5 +1,6 @@
 package uz.chaqmoq.media.handler;
 
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,6 +27,8 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Component
 public class ChaqmoqBot extends TelegramLongPollingBot {
@@ -48,6 +51,9 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
 
     @Value("${audd.api.key:}")
     private String auddApiKey;
+
+    private final ExecutorService downloadExecutor = 
+        Executors.newFixedThreadPool(5); // 5 ta parallel yuklab olish
 
     public ChaqmoqBot(@Value("${telegram.bot.token}") String token,
                       UserService userService,
@@ -268,24 +274,39 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
 
         String url = urlCacheService.resolveUrl(data);
         if (url == null) {
-            editMessage(chatId, messageId, "❌ Havola topilmadi. Qaytadan yuboring.");
+            sendText(chatId, "❌ Havola topilmadi. Qaytadan yuboring.");
             return;
         }
 
         String action = data.substring(0, data.indexOf(":"));
 
         switch (action) {
-            case "dl_video" -> processDownload(chatId, messageId, userId, url, "video");
-            case "dl_video_360" -> processDownload(chatId, messageId, userId, url, "video_360");
-            case "dl_video_480" -> processDownload(chatId, messageId, userId, url, "video_480");
-            case "dl_video_720" -> processDownload(chatId, messageId, userId, url, "video_720");
-            case "dl_video_1080" -> processDownload(chatId, messageId, userId, url, "video_1080");
-            case "dl_audio" -> processDownload(chatId, messageId, userId, url, "audio");
-            case "dl_round" -> processDownload(chatId, messageId, userId, url, "round");
+            case "dl_video" -> processDownload(chatId, userId, url, "video");
+            case "dl_video_360" -> processDownload(chatId, userId, url, "video_360");
+            case "dl_video_480" -> processDownload(chatId, userId, url, "video_480");
+            case "dl_video_720" -> processDownload(chatId, userId, url, "video_720");
+            case "dl_video_1080" -> processDownload(chatId, userId, url, "video_1080");
+            case "dl_audio" -> processDownload(chatId, userId, url, "audio");
+            case "dl_round" -> processDownload(chatId, userId, url, "round");
         }
     }
 
-    private void processDownload(Long chatId, Integer messageId, Long userId, String url, String type) {
+    private void processDownload(Long chatId, Long userId, String url, String type) {
+        downloadExecutor.submit(() -> {
+            try {
+                processDownloadInternal(chatId, userId, url, type);
+            } catch (Exception e) {
+                logger.error("Download error", e);
+                try {
+                    sendText(chatId, "❌ Yuklab olishda xatolik yuz berdi.");
+                } catch (Exception ex) {
+                    logger.error("Could not send error message", ex);
+                }
+            }
+        });
+    }
+
+    private void processDownloadInternal(Long chatId, Long userId, String url, String type) throws TelegramApiException {
         PlatformDetector.Platform platform = platformDetector.detect(url);
         String typeName = switch (type) {
             case "audio" -> "audio (MP3)";
@@ -877,6 +898,11 @@ public class ChaqmoqBot extends TelegramLongPollingBot {
             // O'chirib bo'lmasa — ignore
             logger.debug("Could not delete message: {}", e.getMessage());
         }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        downloadExecutor.shutdown();
     }
 
     private String getToken() {
